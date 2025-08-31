@@ -1,3 +1,4 @@
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image
@@ -11,11 +12,50 @@ import logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# 初始化应用
+# 全局变量存储模型和处理器
+model = None
+processor = None
+device = None
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """模型生命周期管理 (替代弃用的 on_event)"""
+    global model, processor, device
+    
+    # 加载模型 (启动时)
+    logger.info("正在加载模型...")
+    start_time = time.time()
+    
+    try:
+        # 检测设备
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        logger.info(f"使用设备: {device}")
+        
+        # 加载模型和处理器
+        model = CLIPModel.from_pretrained("openai/clip-vit-large-patch14").to(device)
+        processor = CLIPProcessor.from_pretrained("openai/clip-vit-large-patch14", use_fast=False)
+        
+        model.eval()  # 设置为评估模式
+        
+        load_time = time.time() - start_time
+        logger.info(f"模型加载完成! 耗时: {load_time:.2f}秒")
+        yield
+    except Exception as e:
+        logger.error(f"模型加载失败: {str(e)}")
+        raise
+    
+    # 清理资源 (关闭时)
+    logger.info("清理模型资源...")
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    logger.info("资源清理完成")
+
+# 初始化应用（使用新的 lifespan 处理器）
 app = FastAPI(
     title="CLIP Model API",
     description="API for OpenAI's CLIP model for image-text similarity",
-    version="1.0.0"
+    version="1.0.0",
+    lifespan=lifespan  # 使用新的生命周期处理器
 )
 
 # 允许跨域请求
@@ -26,35 +66,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# 全局变量存储模型和处理器
-model = None
-processor = None
-device = None
-
-@app.on_event("startup")
-async def load_model():
-    """在应用启动时加载模型"""
-    global model, processor, device
-    
-    logger.info("正在加载模型...")
-    start_time = time.time()
-    
-    # 检测设备
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    logger.info(f"使用设备: {device}")
-    
-    # 加载模型和处理器
-    try:
-        model = CLIPModel.from_pretrained("openai/clip-vit-large-patch14").to(device)
-        processor = CLIPProcessor.from_pretrained("openai/clip-vit-large-patch14")
-        model.eval()  # 设置为评估模式
-        
-        load_time = time.time() - start_time
-        logger.info(f"模型加载完成! 耗时: {load_time:.2f}秒")
-    except Exception as e:
-        logger.error(f"模型加载失败: {str(e)}")
-        raise HTTPException(status_code=500, detail="模型加载失败")
 
 @app.get("/")
 async def health_check():
@@ -68,13 +79,13 @@ async def health_check():
 @app.post("/predict")
 async def predict(
     image: UploadFile = File(..., description="上传的图像文件"),
-    texts: str = "a photo of a cat,a photo of a dog",
+    text: str = "",
     return_probs: bool = True
 ):
     """执行图像-文本相似度预测
     
     - **image**: 上传的图像文件 (JPEG, PNG)
-    - **texts**: 逗号分隔的文本描述列表
+    - **text**: 文本描述
     - **return_probs**: 是否返回概率分布 (默认为True)
     """
     start_time = time.time()
@@ -88,12 +99,9 @@ async def predict(
         contents = await image.read()
         pil_image = Image.open(io.BytesIO(contents))
         
-        # 处理文本输入
-        text_list = [text.strip() for text in texts.split(",")]
-        
         # 预处理输入
         inputs = processor(
-            text=text_list,
+            text=text,
             images=pil_image,
             return_tensors="pt",
             padding=True
@@ -110,17 +118,12 @@ async def predict(
         
         # 构建响应
         response = {
-            "texts": text_list,
-            "predictions": []
-        }
-        
-        for i, text in enumerate(text_list):
-            prediction = {
+            "prediction": {
                 "text": text,
-                "similarity_score": float(logits_per_image[0, i].item()),
-                "probability": float(probs[i]) if return_probs else None
+                "similarity_score": float(logits_per_image[0, 0].item()),
+                "probability": float(probs[0]) if return_probs else None
             }
-            response["predictions"].append(prediction)
+        }
         
         # 添加性能指标
         inference_time = time.time() - start_time
